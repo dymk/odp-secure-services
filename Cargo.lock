@@ -246,7 +246,6 @@ dependencies = [
  "embedded-io",
  "embedded-services",
  "log",
- "mctp-rs",
  "num_enum",
  "odp-client",
  "odp-ffa",
