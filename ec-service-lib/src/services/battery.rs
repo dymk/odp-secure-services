@@ -4,8 +4,8 @@
 //! Transport-agnostic via the [`odp_client::Relay`] trait. [`Battery`]
 //! is generic over `R: Relay`; the concrete relay impl (e.g.
 //! `OdpClient<SerialTransport<Pl011Uart>>` in production, or
-//! `OdpClient<LoopbackTransport>` in tests) is inferred at the wiring
-//! call site. Battery itself never names a transport type.
+//! `OdpClient<T>` for any `T: OdpTransport` in tests) is inferred at the
+//! wiring call site. Battery itself never names a transport type.
 //!
 //! # Wire format (must match the EC's `OdpRelayHandler` byte-for-byte)
 //!
@@ -69,9 +69,6 @@ pub struct BstReturnRaw {
 pub enum BatteryError {
     /// Relay (MCTP + transport) failure — see [`OdpError`].
     Relay(OdpError),
-    /// EC's response was not a Battery service response or not the
-    /// expected message id.
-    UnexpectedResponse,
 }
 
 impl From<OdpError> for BatteryError {
@@ -120,9 +117,13 @@ impl<'r, R: Relay> Battery<'r, R> {
             .invoke(request_header, &request_body)
             .map_err(BatteryError::Relay)?;
         // `OdpClient::invoke` already validated the message_id round-trip;
-        // we only need to confirm the response is for the Battery service.
+        // we only need to confirm the response is for the Battery service,
+        // is not an error response, and has a long-enough body.
         if response.header.service != OdpService::Battery {
             return Err(BatteryError::Relay(OdpError::UnexpectedResponseKind));
+        }
+        if response.header.is_error {
+            return Err(BatteryError::Relay(OdpError::Decode));
         }
         if response.body.len() < GET_BST_RESPONSE_BODY_LEN {
             return Err(BatteryError::Relay(OdpError::Decode));
