@@ -243,7 +243,6 @@ dependencies = [
  "aarch64-cpu",
  "battery-service-interface",
  "battery-service-relay",
- "embedded-io",
  "embedded-services",
  "log",
  "num_enum",
