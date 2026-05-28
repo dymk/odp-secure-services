@@ -82,7 +82,7 @@ dependencies = [
 [[package]]
 name = "battery-service-interface"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?rev=ae683b5#ae683b5021480f61657d5706fd3d0c6a175c9fcc"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
  "embedded-batteries-async",
 ]
@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "battery-service-relay"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?rev=ae683b5#ae683b5021480f61657d5706fd3d0c6a175c9fcc"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
  "battery-service-interface",
  "embedded-services",
@@ -333,7 +333,7 @@ dependencies = [
 [[package]]
 name = "embedded-services"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?rev=ae683b5#ae683b5021480f61657d5706fd3d0c6a175c9fcc"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
  "cortex-m",
  "critical-section",
@@ -566,7 +566,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 [[package]]
 name = "mctp-rs"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?rev=ae683b5#ae683b5021480f61657d5706fd3d0c6a175c9fcc"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
  "bit-register 0.1.0 (git+https://github.com/OpenDevicePartnership/odp-utilities)",
  "crc",
@@ -630,7 +630,7 @@ dependencies = [
 [[package]]
 name = "odp-client"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?rev=ae683b5#ae683b5021480f61657d5706fd3d0c6a175c9fcc"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
  "bitfield 0.17.0",
  "embedded-io",
