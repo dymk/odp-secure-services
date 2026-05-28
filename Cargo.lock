@@ -248,6 +248,7 @@ dependencies = [
  "log",
  "mctp-rs",
  "num_enum",
+ "odp-client",
  "odp-ffa",
  "uuid",
 ]

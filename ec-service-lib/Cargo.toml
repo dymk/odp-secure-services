@@ -19,6 +19,7 @@ num_enum.workspace = true
 log.workspace = true
 embedded-io.workspace = true
 mctp-rs = { workspace = true, features = ["serial"] }
+odp-client = { workspace = true }
 
 [target.'cfg(target_os = "none")'.dependencies]
 aarch64-cpu.workspace = true
