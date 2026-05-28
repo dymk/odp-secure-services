@@ -1,11 +1,11 @@
 //! `Battery` — FFA service that proxies Normal-World `GetBst` requests
 //! to the EC's `BatteryServiceRelayHandler` over MCTP.
 //!
-//! Transport-agnostic via the [`crate::services::ec_relay::Relay`] trait.
-//! [`Battery`] is generic over `R: Relay`; the concrete relay impl
-//! (e.g. `EcRelay<MctpSerialTransport<Pl011Uart>>` in production, or
-//! `EcRelay<LoopbackTransport>` in tests) is inferred at the wiring
-//! call site. Battery itself never names a transport type.
+//! Transport-agnostic via the [`odp_client::Relay`] trait. [`Battery`]
+//! is generic over `R: Relay`; the concrete relay impl (e.g.
+//! `OdpClient<SerialTransport<Pl011Uart>>` in production, or
+//! `OdpClient<T>` for any `T: OdpTransport` in tests) is inferred at the
+//! wiring call site. Battery itself never names a transport type.
 //!
 //! # Wire format (must match the EC's `OdpRelayHandler` byte-for-byte)
 //!
@@ -27,9 +27,11 @@
 //!
 //! # SP-side runtime serialization is manual
 //!
-//! `embedded_services::relay::SerializableMessage` does not compile for
+//! `odp_client::SerializableMessage` (re-exported from
+//! `odp_client::serializable`) does not compile for
 //! `aarch64-unknown-none-softfloat` (the SBSA SP target) because
-//! `embassy-sync::ThreadModeRawMutex` is `cortex_m`-gated. As a
+//! `embassy-sync::ThreadModeRawMutex` is `cortex_m`-gated in the
+//! `battery-service-relay` types it would deserialize into. As a
 //! workaround, SP-side runtime serialization for `GetBst` is performed
 //! MANUALLY (1-byte request payload; 4 LE u32 dwords for the response
 //! body). The wire-format gate test in the `tests` module below
@@ -40,14 +42,9 @@ use core::cell::RefCell;
 
 use uuid::{uuid, Uuid};
 
-use crate::services::ec_relay::{self, EcRelayError, Relay};
 use crate::{Result, Service};
+use odp_client::{OdpError, OdpHeader, OdpService, Relay};
 use odp_ffa::{Error as FfaError, MsgSendDirectReq2, MsgSendDirectResp2};
-
-/// Battery service id in the EC's `OdpRelayHandler` instantiation
-/// (canonical value at
-/// `OpenDevicePartnership/odp-embedded-controller::platform/platform-common/src/lib.rs:9`).
-pub const BATTERY_SERVICE_ID: u8 = 0x08;
 
 /// `BatteryCmd::GetBst` discriminant from
 /// `embedded-services/battery-service-relay/src/serialization.rs`.
@@ -70,15 +67,12 @@ pub struct BstReturnRaw {
 /// Errors returned by [`Battery::get_bst`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryError {
-    /// Relay (MCTP + transport) failure — see [`EcRelayError`].
-    Relay(EcRelayError),
-    /// EC's response was not a Battery service response or not the
-    /// expected message id.
-    UnexpectedResponse,
+    /// Relay (MCTP + transport) failure — see [`OdpError`].
+    Relay(OdpError),
 }
 
-impl From<EcRelayError> for BatteryError {
-    fn from(e: EcRelayError) -> Self {
+impl From<OdpError> for BatteryError {
+    fn from(e: OdpError) -> Self {
         BatteryError::Relay(e)
     }
 }
@@ -88,10 +82,10 @@ impl From<EcRelayError> for BatteryError {
 /// takes only a borrow of the wiring-layer-owned `RefCell<R>`.
 ///
 /// Battery is generic over `R: Relay` rather than over a transport
-/// type: it never names `OdpTransport`, `MctpSerialTransport`, or any
-/// UART type. The concrete `R = EcRelay<T>` is inferred at the wiring
-/// call site. This keeps transport-layer details out of the service
-/// layer's API.
+/// type: it never names `OdpTransport`, `SerialTransport`, or any
+/// UART type. The concrete `R = OdpClient<T>` is inferred at the
+/// wiring call site. This keeps transport-layer details out of the
+/// service layer's API.
 ///
 /// Future EC-proxy services (`EcThermal`, `EcFwMgmt`, `EcTimeAlarm`)
 /// follow the same pattern: `Self::new(relay: &'r RefCell<R>)`. They
@@ -110,27 +104,37 @@ impl<'r, R: Relay> Battery<'r, R> {
     /// MCTP relay. Returns the parsed BST body or a relay/wire-format
     /// error.
     pub fn get_bst(&self, battery_id: u8) -> core::result::Result<BstReturnRaw, BatteryError> {
-        let request_header = ec_relay::build_odp_header(true, BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST);
+        let request_header = OdpHeader {
+            is_request: true,
+            service: OdpService::Battery,
+            is_error: false,
+            message_id: BATTERY_CMD_GET_BST,
+        };
         let request_body = [battery_id];
 
-        self.relay
-            .borrow_mut()
-            .invoke(request_header, &request_body, |response| {
-                if response.service_id != BATTERY_SERVICE_ID || response.message_id != BATTERY_CMD_GET_BST {
-                    return Err(EcRelayError::UnexpectedOdpService);
-                }
-                if response.body.len() < GET_BST_RESPONSE_BODY_LEN {
-                    return Err(EcRelayError::BodyTooShort);
-                }
-                let payload = &response.body[..GET_BST_RESPONSE_BODY_LEN];
-                Ok(BstReturnRaw {
-                    battery_state: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
-                    battery_present_rate: u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
-                    battery_remaining_capacity: u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]),
-                    battery_present_voltage: u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]),
-                })
-            })
-            .map_err(BatteryError::Relay)
+        let mut relay = self.relay.borrow_mut();
+        let response = relay
+            .invoke(request_header, &request_body)
+            .map_err(BatteryError::Relay)?;
+        // `OdpClient::invoke` already validated the message_id round-trip;
+        // we only need to confirm the response is for the Battery service,
+        // is not an error response, and has a long-enough body.
+        if response.header.service != OdpService::Battery {
+            return Err(BatteryError::Relay(OdpError::UnexpectedResponseKind));
+        }
+        if response.header.is_error {
+            return Err(BatteryError::Relay(OdpError::Decode));
+        }
+        if response.body.len() < GET_BST_RESPONSE_BODY_LEN {
+            return Err(BatteryError::Relay(OdpError::Decode));
+        }
+        let payload = &response.body[..GET_BST_RESPONSE_BODY_LEN];
+        Ok(BstReturnRaw {
+            battery_state: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            battery_present_rate: u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
+            battery_remaining_capacity: u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]),
+            battery_present_voltage: u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]),
+        })
     }
 }
 
@@ -180,11 +184,43 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::ec_relay::test_util::{frame_response_packets, LoopbackTransport};
-    use crate::services::ec_relay::EcRelay;
     use battery_service_interface::{BatteryState, BstReturn};
     use battery_service_relay::{AcpiBatteryRequest, AcpiBatteryResponse};
-    use embedded_services::relay::SerializableMessage;
+    use odp_client::{OdpClient, OdpTransport, SerializableMessage};
+    use std::rc::Rc;
+    use std::vec::Vec;
+
+    /// Test-only `OdpTransport` impl: records bytes that `OdpClient`
+    /// sends into a shared `Rc<RefCell<Vec<u8>>>` (so the test body can
+    /// inspect the request wire bytes after the round-trip) and returns
+    /// a pre-loaded canned ODP message on the next `recv_message`.
+    /// Operates at the pure ODP message level (4-byte header + body);
+    /// no MCTP framing — that's `SerialTransport`'s job in production,
+    /// and is out of scope for service-layer tests.
+    struct CannedResponseTransport {
+        sent: Rc<RefCell<Vec<u8>>>,
+        response: Vec<u8>,
+    }
+
+    impl OdpTransport for CannedResponseTransport {
+        fn send_message(&mut self, payload: &[u8]) -> core::result::Result<(), OdpError> {
+            self.sent.borrow_mut().extend_from_slice(payload);
+            Ok(())
+        }
+
+        fn recv_message(&mut self, buf: &mut [u8]) -> core::result::Result<usize, OdpError> {
+            if self.response.is_empty() {
+                return Err(OdpError::Transport);
+            }
+            if buf.len() < self.response.len() {
+                return Err(OdpError::BufferTooSmall);
+            }
+            let n = self.response.len();
+            buf[..n].copy_from_slice(&self.response);
+            self.response.clear();
+            Ok(n)
+        }
+    }
 
     fn canned_bst() -> BstReturn {
         BstReturn {
@@ -196,73 +232,67 @@ mod tests {
     }
 
     #[test]
-    fn produces_canonical_get_bst_request_bytes() {
+    fn round_trips_get_bst_against_ec_serializer() {
         // -- Synthesize a response so Battery::get_bst doesn't block on transport read.
+        //    Bytes are produced by the EC's OWN `SerializableMessage`
+        //    impl: any drift in field order/endianness fails the assert.
         let bst = canned_bst();
-        let mut response_payload = [0u8; 16];
+        let mut response_body = [0u8; 16];
         let n = AcpiBatteryResponse::GetBst { bst }
-            .serialize(&mut response_payload)
+            .serialize(&mut response_body)
             .expect("ec-side serialize");
         assert_eq!(n, 16, "GetBst response body must be 16 bytes");
 
-        let response_header = ec_relay::build_odp_header(false, BATTERY_SERVICE_ID, BATTERY_CMD_GET_BST);
-        let framed_response = frame_response_packets(response_header, &response_payload);
+        let response_header = OdpHeader {
+            is_request: false,
+            service: OdpService::Battery,
+            is_error: false,
+            message_id: BATTERY_CMD_GET_BST,
+        };
 
-        // -- Construct the shared EcRelay (wrapping a loopback transport)
-        //    and hand a borrow to the Battery service.
-        let mut transport = LoopbackTransport::new();
-        transport.prime_rx(framed_response.iter().copied());
-        let relay = RefCell::new(EcRelay::new(transport));
+        let mut canned = Vec::new();
+        canned.extend_from_slice(&response_header.to_be_bytes());
+        canned.extend_from_slice(&response_body);
+
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let transport = CannedResponseTransport {
+            sent: Rc::clone(&sent),
+            response: canned,
+        };
+        let relay = RefCell::new(OdpClient::new(transport));
         let svc = Battery::new(&relay);
 
         // -- Drive the round-trip.
         let result = svc.get_bst(0).expect("get_bst should decode synthesized response");
 
-        // -- ASSERT 1 (request side, byte-level):
-        //    Battery's TX bytes (MCTP-framed) decode back to exactly:
-        //      OdpHeader [0x02, 0x08, 0x00, 0x02]  +  payload [0x00]
-        let tx_bytes = relay.borrow().transport().tx.clone();
-        let inner_tx = strip_mctp_framing(&tx_bytes);
-        assert_eq!(
-            inner_tx,
-            std::vec![0x02, 0x08, 0x00, 0x02, 0x00],
-            "Battery GetBst request wire bytes must match the EC's expected encoding exactly"
-        );
+        // -- ASSERT: Battery returned the BST values synthesized at the top.
+        //    The response wire-format gate is exercised: bytes are
+        //    produced by the EC's `AcpiBatteryResponse::serialize` and
+        //    must round-trip through Battery::get_bst's decoder.
+        assert_eq!(result.battery_state, bst.battery_state.bits());
+        assert_eq!(result.battery_present_rate, bst.battery_present_rate);
+        assert_eq!(result.battery_remaining_capacity, bst.battery_remaining_capacity);
+        assert_eq!(result.battery_present_voltage, bst.battery_present_voltage);
 
-        // -- ASSERT 2 (round-trip via the EC's OWN deserializer):
-        //    The bytes Battery produced parse back to GetBst { battery_id: 0 }
-        //    via `AcpiBatteryRequest::deserialize`.
-        let (is_req, svc_id, _is_err, msg_id) = ec_relay::parse_odp_header(&inner_tx[..4]).expect("parse header");
-        assert!(is_req, "must be a request");
-        assert_eq!(svc_id, BATTERY_SERVICE_ID);
-        assert_eq!(msg_id, BATTERY_CMD_GET_BST);
-        let decoded = AcpiBatteryRequest::deserialize(msg_id, &inner_tx[4..])
+        // -- ASSERT: the request bytes that `odp-client` produced parse
+        //    back to `AcpiBatteryRequest::GetBst { battery_id: 0 }` via
+        //    the EC's OWN deserializer. This validates the SP→EC
+        //    request wire format end-to-end without re-asserting raw
+        //    bytes (raw-byte encoding is now owned and tested by
+        //    `odp-client`).
+        let sent = sent.borrow();
+        assert!(sent.len() >= 4, "request must include 4-byte OdpHeader");
+        let mut hdr_bytes = [0u8; 4];
+        hdr_bytes.copy_from_slice(&sent[..4]);
+        let parsed_hdr = OdpHeader::from_be_bytes(hdr_bytes).expect("parse header");
+        assert!(parsed_hdr.is_request, "must be a request");
+        assert_eq!(parsed_hdr.service, OdpService::Battery);
+        assert_eq!(parsed_hdr.message_id, BATTERY_CMD_GET_BST);
+        let decoded = AcpiBatteryRequest::deserialize(parsed_hdr.message_id, &sent[4..])
             .expect("ec-side decoder must accept SP-produced bytes");
         assert!(
             matches!(decoded, AcpiBatteryRequest::GetBst { battery_id: 0 }),
             "EC-side decoder must reconstruct the original request variant"
         );
-
-        // -- ASSERT 3 (response side): Battery returned the BST values
-        //    synthesized at the top.
-        assert_eq!(result.battery_state, bst.battery_state.bits());
-        assert_eq!(result.battery_present_rate, bst.battery_present_rate);
-        assert_eq!(result.battery_remaining_capacity, bst.battery_remaining_capacity);
-        assert_eq!(result.battery_present_voltage, bst.battery_present_voltage);
-    }
-
-    /// Strip MCTP serial framing from the bytes Battery emitted on TX.
-    /// Returns the inner body (post the MCTP-message-type byte): 4 bytes
-    /// of OdpHeader + N bytes of serialized payload.
-    fn strip_mctp_framing(framed: &[u8]) -> std::vec::Vec<u8> {
-        use mctp_rs::{MctpPacketContext, MctpSerialMedium};
-        let mut buf = [0u8; 256];
-        let mut ctx = MctpPacketContext::<MctpSerialMedium>::new(MctpSerialMedium, &mut buf);
-        let message = ctx
-            .deserialize_packet(framed)
-            .expect("deserialize_packet ok")
-            .expect("complete message");
-        assert_eq!(message.message_buffer.message_type(), ec_relay::ODP_MESSAGE_TYPE);
-        message.message_buffer.body().to_vec()
     }
 }
