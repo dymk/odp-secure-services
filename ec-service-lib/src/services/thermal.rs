@@ -15,6 +15,10 @@ const EC_THM_SET_VAR: u8 = 0x6;
 const MAX_SENSORS: usize = 8;
 const MAX_VARS: usize = 16;
 
+// Status codes returned in the `status` field of Thermal responses.
+const THM_STATUS_OK: i64 = 0;
+const THM_STATUS_ERR: i64 = -1;
+
 #[derive(Default)]
 struct GenericRsp {
     status: i64,
@@ -124,11 +128,7 @@ struct ThresholdData {
     high_temp: u32,
 }
 
-#[derive(Default, Clone, Copy)]
-struct CoolingPolicyData {
-    _policy_type: u8,
-}
-
+#[derive(Default)]
 struct ThresholdRsp {
     status: i64,
     timeout: u32,
@@ -165,12 +165,9 @@ impl From<&DirectMessagePayload> for CoolingPolicyReq {
 }
 
 pub struct Thermal {
-    thresholds: [Option<ThresholdData>; MAX_SENSORS],
-    cooling_policies: [Option<CoolingPolicyData>; MAX_SENSORS],
+    thresholds: [ThresholdData; MAX_SENSORS],
     variables: [(Uuid, u32); MAX_VARS],
     var_count: usize,
-    var_timestamps: [u64; MAX_VARS],
-    var_clock: u64,
 }
 
 impl Default for Thermal {
@@ -182,13 +179,21 @@ impl Default for Thermal {
 impl Thermal {
     pub fn new() -> Self {
         Thermal {
-            thresholds: [None; MAX_SENSORS],
-            cooling_policies: [None; MAX_SENSORS],
+            thresholds: [ThresholdData::default(); MAX_SENSORS],
             variables: [(Uuid::nil(), 0u32); MAX_VARS],
             var_count: 0,
-            var_timestamps: [0u64; MAX_VARS],
-            var_clock: 0,
         }
+    }
+
+    // Validates a sensor id and returns its array index, or None if out of range.
+    fn sensor_index(id: u8) -> Option<usize> {
+        let idx = id as usize;
+        (idx < MAX_SENSORS).then_some(idx)
+    }
+
+    // Linear scan for a stored variable by UUID.
+    fn find_var(&self, var_uuid: &Uuid) -> Option<usize> {
+        (0..self.var_count).find(|&i| self.variables[i].0 == *var_uuid)
     }
 
     fn get_temperature(&mut self, msg: &MsgSendDirectReq2) -> TempRsp {
@@ -198,7 +203,7 @@ impl Thermal {
         Yield::new(0x100000000).exec().unwrap();
 
         TempRsp {
-            status: 0x0,
+            status: THM_STATUS_OK,
             temp: 0x1234,
         }
     }
@@ -210,46 +215,36 @@ impl Thermal {
             req.id, req.timeout, req.low_temp, req.high_temp
         );
 
-        let idx = req.id as usize;
-        if idx >= MAX_SENSORS {
-            return GenericRsp { status: -1 };
-        }
+        let Some(idx) = Self::sensor_index(req.id) else {
+            return GenericRsp { status: THM_STATUS_ERR };
+        };
 
-        self.thresholds[idx] = Some(ThresholdData {
+        self.thresholds[idx] = ThresholdData {
             timeout: req.timeout,
             low_temp: req.low_temp,
             high_temp: req.high_temp,
-        });
+        };
 
-        GenericRsp { status: 0 }
+        GenericRsp { status: THM_STATUS_OK }
     }
 
-    fn get_threshold(&mut self, msg: &MsgSendDirectReq2) -> ThresholdRsp {
+    fn get_threshold(&self, msg: &MsgSendDirectReq2) -> ThresholdRsp {
         let id = msg.payload().u8_at(1);
-        let idx = id as usize;
 
-        if idx >= MAX_SENSORS {
+        let Some(idx) = Self::sensor_index(id) else {
             return ThresholdRsp {
-                status: -1,
-                timeout: 0,
-                low_temp: 0,
-                high_temp: 0,
+                status: THM_STATUS_ERR,
+                ..Default::default()
             };
-        }
+        };
 
-        match self.thresholds[idx] {
-            Some(data) => ThresholdRsp {
-                status: 0,
-                timeout: data.timeout,
-                low_temp: data.low_temp,
-                high_temp: data.high_temp,
-            },
-            None => ThresholdRsp {
-                status: 0,
-                timeout: 0,
-                low_temp: 0,
-                high_temp: 0,
-            },
+        // Unset sensors read back as zeroed defaults.
+        let data = self.thresholds[idx];
+        ThresholdRsp {
+            status: THM_STATUS_OK,
+            timeout: data.timeout,
+            low_temp: data.low_temp,
+            high_temp: data.high_temp,
         }
     }
 
@@ -260,19 +255,16 @@ impl Thermal {
             req.id, req.policy_type
         );
 
-        let idx = req.id as usize;
-        if idx >= MAX_SENSORS {
-            return GenericRsp { status: -1 };
+        // Validate the sensor id. The policy is accepted but not stored — there
+        // is no GET command that reads it back.
+        if Self::sensor_index(req.id).is_none() {
+            return GenericRsp { status: THM_STATUS_ERR };
         }
 
-        self.cooling_policies[idx] = Some(CoolingPolicyData {
-            _policy_type: req.policy_type,
-        });
-
-        GenericRsp { status: 0 }
+        GenericRsp { status: THM_STATUS_OK }
     }
 
-    fn get_variable(&mut self, msg: &MsgSendDirectReq2) -> ReadVarRsp {
+    fn get_variable(&self, msg: &MsgSendDirectReq2) -> ReadVarRsp {
         let req: ReadVarReq = msg.payload().into();
         debug!(
             "get_variable instance id: 0x{:x} length: 0x{:x} uuid: {}",
@@ -281,24 +273,24 @@ impl Thermal {
 
         if req.len != 4 {
             error!("get_variable only supports DWORD read");
-            return ReadVarRsp { status: -1, data: 0 };
+            return ReadVarRsp {
+                status: THM_STATUS_ERR,
+                data: 0,
+            };
         }
 
-        // Linear scan for UUID match
-        for i in 0..self.var_count {
-            if self.variables[i].0 == req.var_uuid {
-                // Touch timestamp for LRU tracking
-                self.var_clock += 1;
-                self.var_timestamps[i] = self.var_clock;
-                return ReadVarRsp {
-                    status: 0,
-                    data: self.variables[i].1,
-                };
-            }
+        if let Some(i) = self.find_var(&req.var_uuid) {
+            return ReadVarRsp {
+                status: THM_STATUS_OK,
+                data: self.variables[i].1,
+            };
         }
 
         // UUID not found
-        ReadVarRsp { status: -1, data: 0 }
+        ReadVarRsp {
+            status: THM_STATUS_ERR,
+            data: 0,
+        }
     }
 
     fn set_variable(&mut self, msg: &MsgSendDirectReq2) -> GenericRsp {
@@ -310,41 +302,24 @@ impl Thermal {
 
         if req.len != 4 {
             error!("set_variable only supports DWORD write");
-            return GenericRsp { status: -1 };
+            return GenericRsp { status: THM_STATUS_ERR };
         }
 
-        // Upsert: check if UUID already exists
-        for i in 0..self.var_count {
-            if self.variables[i].0 == req.var_uuid {
-                self.variables[i].1 = req.data;
-                self.var_clock += 1;
-                self.var_timestamps[i] = self.var_clock;
-                return GenericRsp { status: 0 };
-            }
+        // Upsert: update in place if the UUID already exists.
+        if let Some(i) = self.find_var(&req.var_uuid) {
+            self.variables[i].1 = req.data;
+            return GenericRsp { status: THM_STATUS_OK };
         }
 
-        // Insert into open slot or evict LRU
-        if self.var_count < MAX_VARS {
-            self.variables[self.var_count] = (req.var_uuid, req.data);
-            self.var_clock += 1;
-            self.var_timestamps[self.var_count] = self.var_clock;
-            self.var_count += 1;
-        } else {
-            // LRU eviction: find entry with lowest timestamp
-            let mut oldest_idx = 0;
-            let mut oldest_ts = self.var_timestamps[0];
-            for i in 1..MAX_VARS {
-                if self.var_timestamps[i] < oldest_ts {
-                    oldest_ts = self.var_timestamps[i];
-                    oldest_idx = i;
-                }
-            }
-            self.variables[oldest_idx] = (req.var_uuid, req.data);
-            self.var_clock += 1;
-            self.var_timestamps[oldest_idx] = self.var_clock;
+        // Otherwise append to an open slot; reject if the store is full.
+        if self.var_count >= MAX_VARS {
+            error!("set_variable: variable store full");
+            return GenericRsp { status: THM_STATUS_ERR };
         }
+        self.variables[self.var_count] = (req.var_uuid, req.data);
+        self.var_count += 1;
 
-        GenericRsp { status: 0 }
+        GenericRsp { status: THM_STATUS_OK }
     }
 }
 
@@ -595,66 +570,53 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_store_lru_eviction() {
+    fn test_variable_store_full_rejects() {
         let mut thermal = Thermal::new();
 
-        // Fill all 16 slots with unique UUIDs
+        // Fill all 16 slots with unique UUIDs.
         for i in 0..MAX_VARS {
             let mut uuid_bytes = [0u8; 16];
             uuid_bytes[0] = i as u8;
             let var_uuid = Builder::from_slice_le(&uuid_bytes).unwrap().into_uuid();
             let msg = thermal_req(set_variable_payload(&var_uuid, i as u32));
-            thermal.ffa_msg_send_direct_req2(msg).unwrap();
+            let resp = thermal.ffa_msg_send_direct_req2(msg).unwrap();
+            assert_eq!(resp_status(&resp), 0, "slot {i} should be accepted");
         }
 
-        // Verify slot 0 (UUID with byte[0]=0) is accessible
-        let mut uuid0_bytes = [0u8; 16];
-        uuid0_bytes[0] = 0;
-        let uuid0 = Builder::from_slice_le(&uuid0_bytes).unwrap().into_uuid();
-        let get_msg = thermal_req(get_variable_payload(&uuid0));
-        let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
-        assert_eq!(
-            resp.payload().u64_at(0) as i64,
-            0,
-            "uuid0 should be found before eviction"
-        );
-        assert_eq!(resp.payload().u32_at(8), 0, "uuid0 data should be 0");
-
-        // Insert one more (UUID with byte[0]=0xFF) — should evict oldest
-        // uuid0 was set first but we just touched it via get_variable above,
-        // so uuid1 (byte[0]=1, set second, never touched since) is the LRU entry.
+        // A 17th distinct UUID has no open slot — the store rejects it.
         let mut new_uuid_bytes = [0u8; 16];
         new_uuid_bytes[0] = 0xFF;
         let new_uuid = Builder::from_slice_le(&new_uuid_bytes).unwrap().into_uuid();
         let msg = thermal_req(set_variable_payload(&new_uuid, 999));
-        thermal.ffa_msg_send_direct_req2(msg).unwrap();
+        let resp = thermal.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), -1, "store is full; new UUID rejected");
 
-        // uuid1 should now be evicted (it was the true LRU — set second, never accessed)
-        let mut uuid1_bytes = [0u8; 16];
-        uuid1_bytes[0] = 1;
-        let uuid1 = Builder::from_slice_le(&uuid1_bytes).unwrap().into_uuid();
-        let get_msg = thermal_req(get_variable_payload(&uuid1));
-        let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
-        assert_eq!(
-            resp.payload().u64_at(0) as i64,
-            -1,
-            "uuid1 should be evicted (true LRU)"
-        );
-
-        // uuid0 should still be present (it was touched by the get_variable above)
-        let get_msg = thermal_req(get_variable_payload(&uuid0));
-        let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
-        assert_eq!(
-            resp.payload().u64_at(0) as i64,
-            0,
-            "uuid0 should still be found (touched after initial set)"
-        );
-
-        // New UUID should be accessible
+        // The rejected UUID is not retrievable.
         let get_msg = thermal_req(get_variable_payload(&new_uuid));
         let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
-        assert_eq!(resp.payload().u64_at(0) as i64, 0, "new uuid should be found");
-        assert_eq!(resp.payload().u32_at(8), 999, "new uuid data should be 999");
+        assert_eq!(resp.payload().u64_at(0) as i64, -1, "rejected UUID absent");
+
+        // Existing entries are untouched — every original UUID still reads back.
+        for i in 0..MAX_VARS {
+            let mut uuid_bytes = [0u8; 16];
+            uuid_bytes[0] = i as u8;
+            let var_uuid = Builder::from_slice_le(&uuid_bytes).unwrap().into_uuid();
+            let get_msg = thermal_req(get_variable_payload(&var_uuid));
+            let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
+            assert_eq!(resp.payload().u64_at(0) as i64, 0, "uuid {i} retained");
+            assert_eq!(resp.payload().u32_at(8), i as u32, "uuid {i} data retained");
+        }
+
+        // Updating an existing UUID still succeeds even when the store is full.
+        let mut uuid0_bytes = [0u8; 16];
+        uuid0_bytes[0] = 0;
+        let uuid0 = Builder::from_slice_le(&uuid0_bytes).unwrap().into_uuid();
+        let msg = thermal_req(set_variable_payload(&uuid0, 4242));
+        let resp = thermal.ffa_msg_send_direct_req2(msg).unwrap();
+        assert_eq!(resp_status(&resp), 0, "update-in-place allowed when full");
+        let get_msg = thermal_req(get_variable_payload(&uuid0));
+        let resp = thermal.ffa_msg_send_direct_req2(get_msg).unwrap();
+        assert_eq!(resp.payload().u32_at(8), 4242, "uuid0 updated in place");
     }
 
     #[test]
